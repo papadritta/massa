@@ -54,7 +54,7 @@ async fn test_protocol_sends_valid_operations_it_receives_to_consensus() {
                 Some(ProtocolPoolEvent::ReceivedOperations { operations, .. }) => operations,
                 _ => panic!("Unexpected or no protocol pool event."),
             };
-            assert!(received_operations.contains_key(&expected_operation_id));
+            assert!(received_operations.contains(&expected_operation_id));
 
             (
                 network_controller,
@@ -744,14 +744,7 @@ async fn test_protocol_does_not_propagates_operations_when_receiving_those_insid
                 }) => {
                     let expected_id = operation.verify_integrity().unwrap();
                     assert!(!propagate);
-                    assert_eq!(
-                        operations
-                            .get(&expected_id)
-                            .unwrap()
-                            .verify_integrity()
-                            .unwrap(),
-                        expected_id
-                    );
+                    assert!(operations.contains(&expected_id));
                     assert_eq!(operations.len(), 1);
                 }
                 Some(_) => panic!("Unexpected protocol pool event."),

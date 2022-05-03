@@ -10,6 +10,7 @@ use massa_models::{
     SignedOperation, Slot,
 };
 use massa_protocol_exports::{ProtocolCommandSender, ProtocolPoolEvent, ProtocolPoolEventReceiver};
+use massa_storage::Storage;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
@@ -121,6 +122,7 @@ impl PoolWorker {
         protocol_pool_event_receiver: ProtocolPoolEventReceiver,
         controller_command_rx: mpsc::Receiver<PoolCommand>,
         controller_manager_rx: mpsc::Receiver<PoolManagementCommand>,
+        storage: Storage,
     ) -> Result<PoolWorker, PoolError> {
         massa_trace!("pool.pool_worker.new", {});
         Ok(PoolWorker {
@@ -128,7 +130,7 @@ impl PoolWorker {
             protocol_pool_event_receiver,
             controller_command_rx,
             controller_manager_rx,
-            operation_pool: OperationPool::new(cfg),
+            operation_pool: OperationPool::new(cfg, storage),
             endorsement_pool: EndorsementPool::new(cfg),
         })
     }
@@ -323,15 +325,15 @@ impl PoolWorker {
                 propagate,
             } => {
                 if propagate {
-                    let newly_added = self.operation_pool.add_operations(operations.clone())?;
-                    operations.retain(|op_id, _op| newly_added.contains(op_id));
+                    let newly_added = self.operation_pool.process_operations(operations.clone())?;
+                    operations.retain(|op_id| newly_added.contains(op_id));
                     if !operations.is_empty() {
                         self.protocol_command_sender
-                            .propagate_operations(operations.keys().cloned().collect())
+                            .propagate_operations(operations)
                             .await?;
                     }
                 } else {
-                    self.operation_pool.add_operations(operations)?;
+                    self.operation_pool.process_operations(operations)?;
                 }
             }
             ProtocolPoolEvent::ReceivedEndorsements {

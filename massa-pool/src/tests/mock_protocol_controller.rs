@@ -1,21 +1,24 @@
 // Copyright (c) 2022 MASSA LABS <info@massa.net>
 
 use massa_models::prehash::Map;
+use massa_models::SerializeCompact;
 use massa_models::{constants::CHANNEL_SIZE, EndorsementId, OperationId};
 use massa_models::{SignedEndorsement, SignedOperation};
 use massa_protocol_exports::{
     ProtocolCommand, ProtocolCommandSender, ProtocolPoolEvent, ProtocolPoolEventReceiver,
 };
+use massa_storage::Storage;
 use massa_time::MassaTime;
 use tokio::{sync::mpsc, time::sleep};
 
 pub struct MockProtocolController {
     protocol_command_rx: mpsc::Receiver<ProtocolCommand>,
     pool_event_tx: mpsc::Sender<ProtocolPoolEvent>,
+    storage: Storage,
 }
 
 impl MockProtocolController {
-    pub fn new() -> (Self, ProtocolCommandSender, ProtocolPoolEventReceiver) {
+    pub fn new(storage: Storage) -> (Self, ProtocolCommandSender, ProtocolPoolEventReceiver) {
         let (protocol_command_tx, protocol_command_rx) =
             mpsc::channel::<ProtocolCommand>(CHANNEL_SIZE);
         let (pool_event_tx, pool_event_rx) = mpsc::channel::<ProtocolPoolEvent>(CHANNEL_SIZE);
@@ -23,6 +26,7 @@ impl MockProtocolController {
             MockProtocolController {
                 protocol_command_rx,
                 pool_event_tx,
+                storage,
             },
             ProtocolCommandSender(protocol_command_tx),
             ProtocolPoolEventReceiver(pool_event_rx),
@@ -47,9 +51,20 @@ impl MockProtocolController {
     }
 
     pub async fn received_operations(&mut self, operations: Map<OperationId, SignedOperation>) {
+        let operation_ids = operations.keys().cloned().collect();
+
+        // Add to shared storage.
+        for (operation_id, operation) in operations {
+            let serialized = operation
+                .to_bytes_compact()
+                .expect("Failed to serialize operation.");
+            self.storage
+                .store_operation(operation_id, operation, serialized);
+        }
+
         self.pool_event_tx
             .send(ProtocolPoolEvent::ReceivedOperations {
-                operations,
+                operations: operation_ids,
                 propagate: true,
             })
             .await

@@ -2,10 +2,11 @@
 
 use crate::{settings::PoolConfig, PoolError};
 use massa_models::prehash::{Map, Set};
+use massa_models::SerializeCompact;
 use massa_models::{
-    Address, OperationId, OperationSearchResult, OperationSearchResultStatus, SerializeCompact,
-    SignedOperation, Slot,
+    Address, OperationId, OperationSearchResult, OperationSearchResultStatus, SignedOperation, Slot,
 };
+use massa_storage::Storage;
 use num::rational::Ratio;
 use std::{collections::BTreeSet, usize};
 
@@ -37,33 +38,30 @@ impl OperationIndex {
 }
 
 struct WrappedOperation {
-    op: SignedOperation,
     byte_count: u64,
     thread: u8,
+    expire_period: u64,
+    ledger_involved_addresses: Set<Address>,
+    /// The priority of the operation based on how much it profits the block producer
+    /// vs how much space it takes in the block
+    fee_density: Ratio<u64>,
 }
 
 impl WrappedOperation {
-    fn new(op: SignedOperation, thread_count: u8) -> Result<Self, PoolError> {
+    fn new(
+        thread: u8,
+        byte_count: u64,
+        expire_period: u64,
+        ledger_involved_addresses: Set<Address>,
+        fee_density: Ratio<u64>,
+    ) -> Result<Self, PoolError> {
         Ok(WrappedOperation {
-            byte_count: op.to_bytes_compact()?.len() as u64,
-            thread: Address::from_public_key(&op.content.sender_public_key)
-                .get_thread(thread_count),
-            op,
+            byte_count,
+            thread,
+            expire_period,
+            ledger_involved_addresses,
+            fee_density,
         })
-    }
-
-    /// Gets the priority of the operation based on how much it profits the block producer
-    /// vs how much space it takes in the block
-    fn get_fee_density(&self) -> Ratio<u64> {
-        // add inclusion fee and gas fees
-        let total_return = self
-            .op
-            .content
-            .fee
-            .saturating_add(self.op.content.get_gas_coins());
-
-        // return ratio with size
-        Ratio::new(total_return.to_raw(), self.byte_count)
     }
 }
 
@@ -82,10 +80,12 @@ pub struct OperationPool {
     cfg: &'static PoolConfig,
     /// ids of operations that are final with expire period and thread
     final_operations: Map<OperationId, (u64, u8)>,
+    /// Shared storage.
+    storage: Storage,
 }
 
 impl OperationPool {
-    pub fn new(cfg: &'static PoolConfig) -> OperationPool {
+    pub fn new(cfg: &'static PoolConfig, storage: Storage) -> OperationPool {
         OperationPool {
             ops: Default::default(),
             ops_by_thread_and_interest: vec![BTreeSet::new(); cfg.thread_count as usize],
@@ -94,19 +94,39 @@ impl OperationPool {
             cfg,
             final_operations: Default::default(),
             ops_by_address: OperationIndex::new(),
+            storage,
         }
     }
 
-    /// Incoming operations. Returns newly added
-    ///
+    /// Add operations received via the API.
+    /// Returns newly added.
     pub fn add_operations(
         &mut self,
         operations: Map<OperationId, SignedOperation>,
     ) -> Result<Set<OperationId>, PoolError> {
+        let operation_ids = operations.keys().cloned().collect();
+
+        // Add to shared storage.
+        for (operation_id, operation) in operations {
+            let serialized = operation.to_bytes_compact()?;
+            self.storage
+                .store_operation(operation_id, operation, serialized);
+        }
+
+        // Process the newly added operations.
+        self.process_operations(operation_ids)
+    }
+
+    /// Process incoming operations.
+    /// Returns newly added.
+    pub fn process_operations(
+        &mut self,
+        operations: Set<OperationId>,
+    ) -> Result<Set<OperationId>, PoolError> {
         let mut newly_added = Set::<OperationId>::default();
 
-        for (op_id, operation) in operations.into_iter() {
-            massa_trace!("pool add_operations op", { "op": operation });
+        for op_id in operations.into_iter() {
+            massa_trace!("pool add_operations op", { "op_id": op_id });
 
             // Already present
             if self.ops.contains_key(&op_id) {
@@ -121,7 +141,49 @@ impl OperationPool {
             }
 
             // wrap
-            let wrapped_op = WrappedOperation::new(operation, self.cfg.thread_count)?;
+            let (wrapped_op, validity_start_period) = {
+                let stored_operation =
+                    self.storage.retrieve_operation(&op_id).ok_or_else(|| {
+                        PoolError::MissingOperation(format!(
+                            "missing operation when adding it to the pool: {}",
+                            op_id
+                        ))
+                    })?;
+                let stored_operation = stored_operation.read();
+
+                let byte_count = stored_operation.serialized.len() as u64;
+
+                // Fee density
+                // add inclusion fee and gas fees
+                let total_return = stored_operation
+                    .operation
+                    .content
+                    .fee
+                    .saturating_add(stored_operation.operation.content.get_gas_coins());
+                // return ratio with size
+                let fee_density = Ratio::new(total_return.to_raw(), byte_count);
+                let thread =
+                    Address::from_public_key(&stored_operation.operation.content.sender_public_key)
+                        .get_thread(self.cfg.thread_count);
+                let ledger_involved_addresses = stored_operation
+                    .operation
+                    .content
+                    .get_ledger_involved_addresses()?;
+                let wrapped = WrappedOperation::new(
+                    thread,
+                    byte_count,
+                    stored_operation.operation.content.expire_period,
+                    ledger_involved_addresses,
+                    fee_density,
+                )?;
+                let validity_start_period = stored_operation
+                    .operation
+                    .content
+                    .get_validity_range(self.cfg.operation_validity_periods)
+                    .start()
+                    .clone();
+                (wrapped, validity_start_period)
+            };
 
             // check if too much in the future
             if let Some(cur_slot) = self.current_slot {
@@ -130,12 +192,6 @@ impl OperationPool {
                 } else {
                     cur_slot.period.saturating_sub(1)
                 };
-
-                let validity_start_period = *wrapped_op
-                    .op
-                    .content
-                    .get_validity_range(self.cfg.operation_validity_periods)
-                    .start();
 
                 if validity_start_period.saturating_sub(cur_period_in_thread)
                     > self
@@ -152,27 +208,25 @@ impl OperationPool {
             }
 
             // check if expired
-            if wrapped_op.op.content.expire_period
-                <= self.last_final_periods[wrapped_op.thread as usize]
-            {
-                massa_trace!("pool add_operations wrapped_op.op.content.expire_period <= self.last_final_periods[wrapped_op.thread as usize]", {
-                    "expire_period": wrapped_op.op.content.expire_period,
+            if wrapped_op.expire_period <= self.last_final_periods[wrapped_op.thread as usize] {
+                massa_trace!("pool add_operations wrapped_op.expire_period <= self.last_final_periods[wrapped_op.thread as usize]", {
+                    "expire_period": wrapped_op.expire_period,
                     "self.last_final_periods[wrapped_op.thread as usize]": self.last_final_periods[wrapped_op.thread as usize]
                 });
                 continue;
             }
 
             // insert
-            let interest = (std::cmp::Reverse(wrapped_op.get_fee_density()), op_id);
-            let addrs = wrapped_op.op.content.get_ledger_involved_addresses()?;
+            let interest = (std::cmp::Reverse(wrapped_op.fee_density), op_id);
 
             self.ops_by_thread_and_interest[wrapped_op.thread as usize].insert(interest);
+            wrapped_op
+                .ledger_involved_addresses
+                .iter()
+                .for_each(|addr| {
+                    self.ops_by_address.insert_op(*addr, op_id);
+                });
             self.ops.insert(op_id, wrapped_op);
-
-            addrs.iter().for_each(|addr| {
-                self.ops_by_address.insert_op(*addr, op_id);
-            });
-
             newly_added.insert(op_id);
         }
 
@@ -187,8 +241,7 @@ impl OperationPool {
                     .unwrap(); // will not panic because of the while condition. complexity = log or better
                 if let Some(removed_op) = self.ops.remove(&removed_id) {
                     // complexity: const
-                    let addrs = removed_op.op.content.get_ledger_involved_addresses()?;
-                    for addr in addrs {
+                    for addr in removed_op.ledger_involved_addresses {
                         self.ops_by_address
                             .remove_op_for_address(&addr, &removed_id);
                     }
@@ -207,9 +260,8 @@ impl OperationPool {
         for (id, _) in ops.iter() {
             if let Some(wrapped) = self.ops.remove(id) {
                 self.ops_by_thread_and_interest[wrapped.thread as usize]
-                    .remove(&(std::cmp::Reverse(wrapped.get_fee_density()), *id));
-                let addrs = wrapped.op.content.get_ledger_involved_addresses()?;
-                for addr in addrs {
+                    .remove(&(std::cmp::Reverse(wrapped.fee_density), *id));
+                for addr in wrapped.ledger_involved_addresses {
                     self.ops_by_address.remove_op_for_address(&addr, id);
                 }
             } // else final op wasn't in pool.
@@ -231,7 +283,7 @@ impl OperationPool {
             .ops
             .iter()
             .filter(|(_id, w_op)| {
-                w_op.op.content.expire_period <= self.last_final_periods[w_op.thread as usize]
+                w_op.expire_period <= self.last_final_periods[w_op.thread as usize]
             })
             .map(|(id, _)| *id)
             .collect();
@@ -256,21 +308,25 @@ impl OperationPool {
         self.prune()
     }
 
-    // removes an operation
+    // Removes a list of operations from the pool.
     fn remove_ops(&mut self, op_ids: Vec<OperationId>) -> Result<(), PoolError> {
+        // Remove from shared storage.
+        self.storage.remove_operations(&op_ids);
+
+        // Remove from internal structures.
         for op_id in op_ids.into_iter() {
             if let Some(wrapped_op) = self.ops.remove(&op_id) {
                 // complexity: const
-                let interest = (std::cmp::Reverse(wrapped_op.get_fee_density()), op_id);
+                let interest = (std::cmp::Reverse(wrapped_op.fee_density), op_id);
                 self.ops_by_thread_and_interest[wrapped_op.thread as usize].remove(&interest);
                 // complexity: log
 
-                let addrs = wrapped_op.op.content.get_ledger_involved_addresses()?;
-                for addr in addrs {
+                for addr in wrapped_op.ledger_involved_addresses {
                     self.ops_by_address.remove_op_for_address(&addr, &op_id);
                 }
             }
         }
+
         Ok(())
     }
 
@@ -290,10 +346,14 @@ impl OperationPool {
                     return None;
                 }
                 if let Some(w_op) = self.ops.get(id) {
-                    if !w_op.op.content.get_validity_range(self.cfg.operation_validity_periods)
+                    let stored_operation = self
+                        .storage
+                        .retrieve_operation(id)?;
+                    let stored_operation = stored_operation.read();
+                    if !stored_operation.operation.content.get_validity_range(self.cfg.operation_validity_periods)
                         .contains(&block_slot.period) || w_op.byte_count > max_size {
                             massa_trace!("pool get_operation_batch not added to batch w_op.op.content.get_validity_range incorrect not added", {
-                                "range": w_op.op.content.get_validity_range(self.cfg.operation_validity_periods),
+                                "range": stored_operation.operation.content.get_validity_range(self.cfg.operation_validity_periods),
                                 "block_slot.period": block_slot.period,
                                 "operation_id": id,
                                 "max_size_overflow": w_op.byte_count > max_size,
@@ -301,7 +361,7 @@ impl OperationPool {
                             });
                         return None;
                     }
-                    Some(Ok((*id, w_op.op.clone(), w_op.byte_count)))
+                    Some(Ok((*id, stored_operation.operation.clone(), w_op.byte_count)))
                 } else {
                     Some(Err(PoolError::ContainerInconsistency(
                         format!("operation pool get_ops inconsistency: op_id={} is in ops_by_thread_and_interest but not in ops", id)
@@ -318,7 +378,11 @@ impl OperationPool {
     ) -> Map<OperationId, SignedOperation> {
         operation_ids
             .iter()
-            .filter_map(|op_id| self.ops.get(op_id).map(|w_op| (*op_id, w_op.op.clone())))
+            .filter_map(|op_id| {
+                self.storage
+                    .retrieve_operation(op_id)
+                    .map(|stored| (*op_id, stored.read().operation.clone()))
+            })
             .collect()
     }
 
@@ -330,8 +394,8 @@ impl OperationPool {
             ids.iter()
                 .take(self.cfg.settings.max_item_return_count)
                 .map(|op_id| {
-                    self.ops
-                        .get(op_id)
+                    self.storage
+                        .retrieve_operation(op_id)
                         .ok_or_else(|| {
                             PoolError::ContainerInconsistency(
                                 "op in ops by address is not in ops".to_string(),
@@ -341,7 +405,7 @@ impl OperationPool {
                             (
                                 *op_id,
                                 OperationSearchResult {
-                                    op: op.op.clone(),
+                                    op: op.read().operation.clone(),
                                     in_pool: true,
                                     in_blocks: Map::default(),
                                     status: OperationSearchResultStatus::Pending,

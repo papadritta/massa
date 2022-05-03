@@ -38,7 +38,7 @@ fn get_transaction(expire_period: u64, fee: u64) -> (SignedOperation, u8) {
 #[test]
 #[serial]
 fn test_pool() {
-    let mut pool = OperationPool::new(&POOL_CONFIG);
+    let mut pool = OperationPool::new(&POOL_CONFIG, Default::default());
 
     // generate (id, transactions, range of validity) by threads
     let mut thread_tx_lists = vec![Vec::new(); POOL_CONFIG.thread_count as usize];

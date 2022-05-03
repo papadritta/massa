@@ -10,9 +10,7 @@ use massa_models::{
     Slot,
 };
 
-use massa_models::{
-    BlockId, EndorsementId, OperationId, SignedEndorsement, SignedHeader, SignedOperation,
-};
+use massa_models::{BlockId, EndorsementId, OperationId, SignedEndorsement, SignedHeader};
 use massa_network_exports::NetworkEventReceiver;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -49,7 +47,7 @@ pub enum ProtocolPoolEvent {
     /// Operations were received
     ReceivedOperations {
         /// the operations
-        operations: Map<OperationId, SignedOperation>,
+        operations: Set<OperationId>,
         /// whether or not to propagate operations
         propagate: bool,
     },

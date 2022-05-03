@@ -10,7 +10,8 @@ use massa_models::{
     operation::{OperationIds, Operations},
     prehash::{BuildMap, Map, Set},
     signed::Signable,
-    Address, Block, BlockId, EndorsementId, OperationId, SignedEndorsement, SignedHeader,
+    Address, Block, BlockId, EndorsementId, OperationId, SerializeCompact, SignedEndorsement,
+    SignedHeader,
 };
 use massa_network_exports::{NetworkCommandSender, NetworkEvent, NetworkEventReceiver};
 use massa_protocol_exports::{
@@ -1098,7 +1099,7 @@ impl ProtocolWorker {
         let length = operations.len();
         let mut has_duplicate_operations = false;
         let mut seen_ops = vec![];
-        let mut new_operations = Map::with_capacity_and_hasher(length, BuildMap::default());
+        let mut new_operations = Set::with_capacity_and_hasher(length, BuildMap::default());
         let mut received_ids = Map::with_capacity_and_hasher(length, BuildMap::default());
         for (idx, operation) in operations.into_iter().enumerate() {
             let operation_id = operation.content.compute_id()?;
@@ -1121,7 +1122,13 @@ impl ProtocolWorker {
             if self.checked_operations.insert(operation_id) {
                 // check signature
                 operation.verify_signature(&operation.content.sender_public_key)?;
-                new_operations.insert(operation_id, operation);
+                new_operations.insert(operation_id);
+
+                // Add to shared storage.
+                // TODO: use serialized format as received from network.
+                let serialized = operation.to_bytes_compact()?;
+                self.storage
+                    .store_operation(operation_id, operation, serialized);
             };
         }
 
